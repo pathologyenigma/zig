@@ -80,6 +80,22 @@ pub extern "c" fn posix_spawnattr_destroy(attr: *posix_spawnattr_t) void;
 pub extern "c" fn posix_spawnattr_setflags(attr: *posix_spawnattr_t, flags: c_short) c_int;
 pub extern "c" fn posix_spawn_file_actions_init(actions: *posix_spawn_file_actions_t) c_int;
 pub extern "c" fn posix_spawn_file_actions_destroy(actions: *posix_spawn_file_actions_t) void;
+pub extern "c" fn posix_spawn_file_actions_addclose(actions: *posix_spawn_file_actions_t, filedes: fd_t) c_int;
+pub extern "c" fn posix_spawn_file_actions_addopen(
+    actions: *posix_spawn_file_actions_t,
+    filedes: fd_t,
+    path: [*:0]const u8,
+    oflag: c_int,
+    mode: mode_t,
+) c_int;
+pub extern "c" fn posix_spawn_file_actions_adddup2(
+    actions: *posix_spawn_file_actions_t,
+    filedes: fd_t,
+    newfiledes: fd_t,
+) c_int;
+pub extern "c" fn posix_spawn_file_actions_addinherit_np(actions: *posix_spawn_file_actions_t, filedes: fd_t) c_int;
+pub extern "c" fn posix_spawn_file_actions_addchdir_np(actions: *posix_spawn_file_actions_t, path: [*:0]const u8) c_int;
+pub extern "c" fn posix_spawn_file_actions_addfchdir_np(actions: *posix_spawn_file_actions_t, filedes: fd_t) c_int;
 pub extern "c" fn posix_spawnp(
     pid: *pid_t,
     path: [*:0]const u8,
