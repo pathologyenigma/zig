@@ -4334,6 +4334,75 @@ pub fn fork() ForkError!pid_t {
     }
 }
 
+// pub const posix_spawn_file_actions_t = *opaque {};
+// pub extern "c" fn posix_spawn_file_actions_init(actions: *posix_spawn_file_actions_t) c_int;
+// pub extern "c" fn posix_spawn_file_actions_destroy(actions: *posix_spawn_file_actions_t) void;
+// pub extern "c" fn posix_spawn_file_actions_addclose(actions: *posix_spawn_file_actions_t, filedes: fd_t) c_int;
+// pub extern "c" fn posix_spawn_file_actions_addopen(
+//     actions: *posix_spawn_file_actions_t,
+//     filedes: fd_t,
+//     path: [*:0]const u8,
+//     oflag: c_int,
+//     mode: mode_t,
+// ) c_int;
+// pub extern "c" fn posix_spawn_file_actions_adddup2(
+//     actions: *posix_spawn_file_actions_t,
+//     filedes: fd_t,
+//     newfiledes: fd_t,
+// ) c_int;
+// pub extern "c" fn posix_spawn_file_actions_addinherit_np(actions: *posix_spawn_file_actions_t, filedes: fd_t) c_int;
+// pub extern "c" fn posix_spawn_file_actions_addchdir_np(actions: *posix_spawn_file_actions_t, path: [*:0]const u8) c_int;
+// pub extern "c" fn posix_spawn_file_actions_addfchdir_np(actions: *posix_spawn_file_actions_t, filedes: fd_t) c_int;
+// pub extern "c" fn posix_spawnp(
+//     pid: *pid_t,
+//     path: [*:0]const u8,
+//     actions: ?*const posix_spawn_file_actions_t,
+//     attr: *const posix_spawnattr_t,
+//     argv: [*][*:0]const u8,
+//     env: [*][*:0]const u8,
+// ) c_int;
+
+pub const PosixSpawnAttr = struct {
+    attr: system.posix_spawnattr_t,
+
+    pub const Error = error{
+        OutOfMemory,
+        InvalidAttr,
+    } || UnexpectedError;
+
+    pub fn init() Error!PosixSpawnAttr {
+        var attr: system.posix_spawnattr_t = undefined;
+        switch (errno(system.posix_spawnattr_init(&attr))) {
+            .SUCCESS => return PosixSpawnAttr{ .attr = attr },
+            .NOMEM => return error.OutOfMemory,
+            .INVAL => unreachable,
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+
+    pub fn deinit(self: *PosixSpawnAttr) void {
+        system.posix_spawnattr_destroy(&self.attr);
+        self.* = undefined;
+    }
+
+    pub fn get(self: PosixSpawnAttr) Error!u16 {
+        var flags: c_short = undefined;
+        switch (errno(system.posix_spawnattr_getflags(&self.attr, &flags))) {
+            .SUCCESS => return @bitCast(u16, flags),
+            .INVAL => return error.InvalidAttr,
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+
+    pub fn set(self: *PosixSpawnAttr, flags: u16) Error!void {
+        switch (errno(system.posix_spawnattr_setflags(&self.attr, @bitCast(c_short, flags)))) {
+            .SUCCESS => return,
+            .INVAL => return error.InvalidAttr,
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+};
+
 pub const MMapError = error{
     /// The underlying filesystem of the specified file does not support memory mapping.
     MemoryMappingNotSupported,
