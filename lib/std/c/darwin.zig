@@ -97,13 +97,21 @@ pub extern "c" fn posix_spawn_file_actions_adddup2(
 pub extern "c" fn posix_spawn_file_actions_addinherit_np(actions: *posix_spawn_file_actions_t, filedes: fd_t) c_int;
 pub extern "c" fn posix_spawn_file_actions_addchdir_np(actions: *posix_spawn_file_actions_t, path: [*:0]const u8) c_int;
 pub extern "c" fn posix_spawn_file_actions_addfchdir_np(actions: *posix_spawn_file_actions_t, filedes: fd_t) c_int;
-pub extern "c" fn posix_spawnp(
+pub extern "c" fn posix_spawn(
     pid: *pid_t,
     path: [*:0]const u8,
     actions: ?*const posix_spawn_file_actions_t,
-    attr: *const posix_spawnattr_t,
-    argv: [*][*:0]const u8,
-    env: [*][*:0]const u8,
+    attr: ?*const posix_spawnattr_t,
+    argv: [*:null]?[*:0]const u8,
+    envp: [*:null]?[*:0]const u8,
+) c_int;
+pub extern "c" fn posix_spawnp(
+    pid: *pid_t,
+    file: [*:0]const u8,
+    actions: ?*const posix_spawn_file_actions_t,
+    attr: ?*const posix_spawnattr_t,
+    argv: [*:null]?[*:0]const u8,
+    envp: [*:null]?[*:0]const u8,
 ) c_int;
 
 pub extern "c" fn kevent64(

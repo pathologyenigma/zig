@@ -57,6 +57,9 @@ pub const ChildProcess = struct {
 
     expand_arg0: Arg0Expand,
 
+    /// Darwin-only. Disable ASLR for the child process on request.
+    disable_aslr: bool = false,
+
     pub const Arg0Expand = os.Arg0Expand;
 
     pub const SpawnError = error{
@@ -72,7 +75,13 @@ pub const ChildProcess = struct {
 
         /// Windows-only. `cwd` was provided, but the path did not exist when spawning the child process.
         CurrentWorkingDirectoryUnlinked,
-    } || os.ExecveError || os.SetIdError || os.ChangeCurDirError || windows.CreateProcessError || windows.WaitForSingleObjectError;
+    } ||
+        os.ExecveError ||
+        os.SetIdError ||
+        os.ChangeCurDirError ||
+        windows.CreateProcessError ||
+        windows.WaitForSingleObjectError ||
+        os.posix_spawn.Error;
 
     pub const Term = union(enum) {
         Exited: u8,
@@ -130,6 +139,8 @@ pub const ChildProcess = struct {
 
         if (builtin.os.tag == .windows) {
             return self.spawnWindows();
+        } else if (builtin.os.tag.isDarwin()) {
+            return self.spawnMacos();
         } else {
             return self.spawnPosix();
         }
@@ -166,7 +177,7 @@ pub const ChildProcess = struct {
             return term;
         }
         try os.kill(self.pid, os.SIG.TERM);
-        self.waitUnwrapped();
+        try self.waitUnwrapped();
         return self.term.?;
     }
 
@@ -435,7 +446,7 @@ pub const ChildProcess = struct {
             return term;
         }
 
-        self.waitUnwrapped();
+        try self.waitUnwrapped();
         return self.term.?;
     }
 
@@ -461,8 +472,12 @@ pub const ChildProcess = struct {
         return result;
     }
 
-    fn waitUnwrapped(self: *ChildProcess) void {
-        const status = os.waitpid(self.pid, 0).status;
+    fn waitUnwrapped(self: *ChildProcess) !void {
+        const res: os.WaitPidResult = if (builtin.os.tag.isDarwin())
+            try os.posix_spawn.waitpid(self.pid, 0)
+        else
+            os.waitpid(self.pid, 0);
+        const status = res.status;
         self.cleanupStreams();
         self.handleWaitResult(status);
     }
@@ -487,6 +502,8 @@ pub const ChildProcess = struct {
     }
 
     fn cleanupAfterWait(self: *ChildProcess, status: u32) !Term {
+        if (builtin.os.tag.isDarwin()) return statusToTerm(status);
+
         defer destroyPipe(self.err_pipe);
 
         if (builtin.os.tag == .linux) {
@@ -533,6 +550,114 @@ pub const ChildProcess = struct {
             Term{ .Stopped = os.W.STOPSIG(status) }
         else
             Term{ .Unknown = status };
+    }
+
+    fn spawnMacos(self: *ChildProcess) SpawnError!void {
+        const pipe_flags = if (io.is_async) os.O.NONBLOCK else 0;
+        const stdin_pipe = if (self.stdin_behavior == StdIo.Pipe) try os.pipe2(pipe_flags) else undefined;
+        errdefer if (self.stdin_behavior == StdIo.Pipe) destroyPipe(stdin_pipe);
+
+        const stdout_pipe = if (self.stdout_behavior == StdIo.Pipe) try os.pipe2(pipe_flags) else undefined;
+        errdefer if (self.stdout_behavior == StdIo.Pipe) destroyPipe(stdout_pipe);
+
+        const stderr_pipe = if (self.stderr_behavior == StdIo.Pipe) try os.pipe2(pipe_flags) else undefined;
+        errdefer if (self.stderr_behavior == StdIo.Pipe) destroyPipe(stderr_pipe);
+
+        const any_ignore = (self.stdin_behavior == StdIo.Ignore or self.stdout_behavior == StdIo.Ignore or self.stderr_behavior == StdIo.Ignore);
+        const dev_null_fd = if (any_ignore)
+            os.openZ("/dev/null", os.O.RDWR, 0) catch |err| switch (err) {
+                error.PathAlreadyExists => unreachable,
+                error.NoSpaceLeft => unreachable,
+                error.FileTooBig => unreachable,
+                error.DeviceBusy => unreachable,
+                error.FileLocksNotSupported => unreachable,
+                error.BadPathName => unreachable, // Windows-only
+                error.InvalidHandle => unreachable, // WASI-only
+                error.WouldBlock => unreachable,
+                else => |e| return e,
+            }
+        else
+            undefined;
+        defer if (any_ignore) os.close(dev_null_fd);
+
+        var attr = try os.posix_spawn.Attr.init();
+        defer attr.deinit();
+        var flags: u16 = os.darwin.POSIX_SPAWN_SETSIGDEF | os.darwin.POSIX_SPAWN_SETSIGMASK;
+        if (self.disable_aslr) {
+            flags |= os.darwin._POSIX_SPAWN_DISABLE_ASLR;
+        }
+        try attr.set(flags);
+
+        var actions = try os.posix_spawn.Actions.init();
+        defer actions.deinit();
+
+        try setUpChildIoPosixSpawn(self.stdin_behavior, &actions, stdin_pipe[0], os.STDIN_FILENO, dev_null_fd);
+        try setUpChildIoPosixSpawn(self.stdout_behavior, &actions, stdout_pipe[1], os.STDOUT_FILENO, dev_null_fd);
+        try setUpChildIoPosixSpawn(self.stderr_behavior, &actions, stderr_pipe[1], os.STDERR_FILENO, dev_null_fd);
+
+        if (self.cwd_dir) |cwd| {
+            try actions.fchdir(cwd.fd);
+        } else if (self.cwd) |cwd| {
+            try actions.chdir(cwd);
+        }
+
+        var arena_allocator = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_allocator.deinit();
+        const arena = arena_allocator.allocator();
+
+        const argv_buf = try arena.allocSentinel(?[*:0]u8, self.argv.len, null);
+        for (self.argv) |arg, i| argv_buf[i] = (try arena.dupeZ(u8, arg)).ptr;
+
+        const envp = if (self.env_map) |env_map| m: {
+            const envp_buf = try createNullDelimitedEnvMap(arena, env_map);
+            break :m envp_buf.ptr;
+        } else std.c.environ;
+
+        const pid = try os.posix_spawn.spawnp(self.argv[0], actions, attr, argv_buf, envp);
+
+        if (self.stdin_behavior == StdIo.Pipe) {
+            self.stdin = File{ .handle = stdin_pipe[1] };
+        } else {
+            self.stdin = null;
+        }
+        if (self.stdout_behavior == StdIo.Pipe) {
+            self.stdout = File{ .handle = stdout_pipe[0] };
+        } else {
+            self.stdout = null;
+        }
+        if (self.stderr_behavior == StdIo.Pipe) {
+            self.stderr = File{ .handle = stderr_pipe[0] };
+        } else {
+            self.stderr = null;
+        }
+
+        self.pid = pid;
+        self.term = null;
+
+        if (self.stdin_behavior == StdIo.Pipe) {
+            os.close(stdin_pipe[0]);
+        }
+        if (self.stdout_behavior == StdIo.Pipe) {
+            os.close(stdout_pipe[1]);
+        }
+        if (self.stderr_behavior == StdIo.Pipe) {
+            os.close(stderr_pipe[1]);
+        }
+    }
+
+    fn setUpChildIoPosixSpawn(
+        stdio: StdIo,
+        actions: *os.posix_spawn.Actions,
+        pipe_fd: i32,
+        std_fileno: i32,
+        dev_null_fd: i32,
+    ) !void {
+        switch (stdio) {
+            .Pipe => try actions.dup2(pipe_fd, std_fileno),
+            .Close => try actions.close(std_fileno),
+            .Inherit => {},
+            .Ignore => try actions.dup2(dev_null_fd, std_fileno),
+        }
     }
 
     fn spawnPosix(self: *ChildProcess) SpawnError!void {

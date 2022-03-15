@@ -470,6 +470,7 @@ set(ZIG_STAGE2_SOURCES
     "${CMAKE_SOURCE_DIR}/lib/std/os/windows.zig"
     "${CMAKE_SOURCE_DIR}/lib/std/os/windows/ntstatus.zig"
     "${CMAKE_SOURCE_DIR}/lib/std/os/windows/win32error.zig"
+    "${CMAKE_SOURCE_DIR}/lib/std/os/posix_spawn.zig"
     "${CMAKE_SOURCE_DIR}/lib/std/Progress.zig"
     "${CMAKE_SOURCE_DIR}/lib/std/pdb.zig"
     "${CMAKE_SOURCE_DIR}/lib/std/process.zig"
