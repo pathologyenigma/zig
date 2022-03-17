@@ -2022,12 +2022,12 @@ pub fn writeAtom(self: *MachO, atom: *Atom, match: MatchingSection) !void {
                     std.c.PROT.READ | std.c.PROT.WRITE | std.c.PROT.COPY,
                 );
             }
-            try atom.resolveRelocs(self, slide);
-            const nwritten = try task.writeMem(sym.n_value + slide, atom.code.items, self.base.options.target.cpu.arch);
-            assert(nwritten == atom.code.items.len);
             defer if (!seg.inner.isWriteable()) {
                 task.setCurrProtection(sym.n_value + slide, atom.code.items.len, seg.inner.initprot) catch {};
             };
+            try atom.resolveRelocs(self, slide);
+            const nwritten = try task.writeMem(sym.n_value + slide, atom.code.items, self.base.options.target.cpu.arch);
+            assert(nwritten == atom.code.items.len);
         }
     }
     try atom.resolveRelocs(self, 0x0);
