@@ -124,6 +124,11 @@ const Requirements = struct {
 const Entitlements = struct {
     inner: []const u8,
 
+    fn clone(self: Entitlements, allocator: Allocator) !Entitlements {
+        var inner = try allocator.dupe(u8, self.inner);
+        return Entitlements{ .inner = inner };
+    }
+
     fn deinit(self: *Entitlements, allocator: Allocator) void {
         allocator.free(self.inner);
     }
@@ -308,7 +313,7 @@ pub fn calcAdhocSignature(
     self.inner.length += @sizeOf(macho.BlobIndex) + req.size();
 
     if (self.entitlements) |ents| {
-        try self.blobs.append(allocator, .{ .entitlements = ents });
+        try self.blobs.append(allocator, .{ .entitlements = try ents.clone(allocator) });
         self.inner.count += 1;
         self.inner.length += @sizeOf(macho.BlobIndex) + ents.size();
     }
@@ -336,11 +341,22 @@ pub fn write(self: CodeSignature, writer: anytype) !void {
     }
 }
 
+pub fn reset(self: *CodeSignature, allocator: Allocator) void {
+    self.inner.count = 0;
+    for (self.blobs.items) |*blob| {
+        blob.deinit(allocator);
+    }
+    self.blobs.clearAndFree(allocator);
+}
+
 pub fn deinit(self: *CodeSignature, allocator: Allocator) void {
     for (self.blobs.items) |*blob| {
         blob.deinit(allocator);
     }
     self.blobs.deinit(allocator);
+    if (self.entitlements) |*ents| {
+        ents.deinit(allocator);
+    }
 }
 
 fn writeHeader(self: CodeSignature, writer: anytype) !void {

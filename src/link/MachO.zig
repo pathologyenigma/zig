@@ -1043,7 +1043,8 @@ pub fn flushModule(self: *MachO, comp: *Compilation) !void {
             try d_sym.flushModule(self.base.allocator, self.base.options);
         }
 
-        if (self.code_signature) |_| {
+        if (self.code_signature) |*csig| {
+            csig.reset(self.base.allocator);
             // Preallocate space for the code signature.
             // We need to do this at this stage so that we have the load commands with proper values
             // written out to the file.
