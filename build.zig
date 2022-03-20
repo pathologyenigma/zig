@@ -87,6 +87,7 @@ pub fn build(b: *Builder) !void {
     ) orelse false;
     const enable_macos_sdk = b.option(bool, "enable-macos-sdk", "Run tests requiring presence of macOS SDK and frameworks") orelse false;
     const config_h_path_option = b.option([]const u8, "config_h", "Path to the generated config.h");
+    const entitlements = b.option([]const u8, "entitlements", "Path to entitlements file");
 
     if (!skip_install_lib_files) {
         b.installDirectory(InstallDirectoryOptions{
@@ -150,6 +151,9 @@ pub fn build(b: *Builder) !void {
     exe.setTarget(target);
     if (!skip_stage2_tests) {
         toolchain_step.dependOn(&exe.step);
+    }
+    if (entitlements) |ents| {
+        exe.entitlements = ents;
     }
 
     b.default_step.dependOn(&exe.step);

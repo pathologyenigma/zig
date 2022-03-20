@@ -166,6 +166,8 @@ const Signature = struct {
     }
 };
 
+entitlements: ?Entitlements = null,
+
 /// Code signature blob header.
 inner: macho.SuperBlob = .{
     .magic = macho.CSMAGIC_EMBEDDED_SIGNATURE,
@@ -174,6 +176,15 @@ inner: macho.SuperBlob = .{
 },
 
 blobs: std.ArrayListUnmanaged(Blob) = .{},
+
+pub fn addEntitlements(self: *CodeSignature, allocator: Allocator, path: []const u8) !void {
+    std.log.warn("adding entitlements from file at {s}", .{path});
+    const file = try fs.cwd().openFile(path, .{});
+    defer file.close();
+    const inner = try file.readToEndAlloc(allocator, std.math.maxInt(u32));
+    std.log.warn("  (contents={s})", .{inner});
+    self.entitlements = .{ .inner = inner };
+}
 
 pub fn calcAdhocSignature(
     self: *CodeSignature,
@@ -233,19 +244,14 @@ pub fn calcAdhocSignature(
     }
 
     // 3. Create Entitlements blob
-    const path = "/Users/kubkon/dev/zig/resources/Info.plist";
-    const ff = try std.fs.cwd().openFile(path, .{});
-    defer ff.close();
-    var inner = try ff.readToEndAlloc(allocator, std.math.maxInt(u32));
-    var ent: Entitlements = .{
-        .inner = inner,
-    };
-    {
+    if (self.entitlements) |ents| {
         var buf = std.ArrayList(u8).init(allocator);
         defer buf.deinit();
-        try ent.write(buf.writer());
+        try ents.write(buf.writer());
         Sha256.hash(buf.items, &hash, .{});
         try cdir.data.appendSlice(allocator, &hash);
+    } else {
+        try cdir.data.appendNTimes(allocator, 0, hash_size);
     }
     {
         try cdir.data.appendNTimes(allocator, 0, hash_size);
@@ -301,9 +307,11 @@ pub fn calcAdhocSignature(
     self.inner.count += 1;
     self.inner.length += @sizeOf(macho.BlobIndex) + req.size();
 
-    try self.blobs.append(allocator, .{ .entitlements = ent });
-    self.inner.count += 1;
-    self.inner.length += @sizeOf(macho.BlobIndex) + ent.size();
+    if (self.entitlements) |ents| {
+        try self.blobs.append(allocator, .{ .entitlements = ents });
+        self.inner.count += 1;
+        self.inner.length += @sizeOf(macho.BlobIndex) + ents.size();
+    }
 
     var sig: Signature = .{};
     try self.blobs.append(allocator, .{ .signature = sig });

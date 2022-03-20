@@ -681,6 +681,7 @@ fn buildOutputType(
     var native_darwin_sdk: ?std.zig.system.darwin.DarwinSDK = null;
     var install_name: ?[]const u8 = null;
     var hash_style: link.HashStyle = .both;
+    var entitlements: ?[]const u8 = null;
 
     // e.g. -m3dnow or -mno-outline-atomics. They correspond to std.Target llvm cpu feature names.
     // This array is populated by zig cc frontend and then has to be converted to zig-style
@@ -1049,6 +1050,10 @@ fn buildOutputType(
                         } else {
                             enable_link_snapshots = true;
                         }
+                    } else if (mem.eql(u8, arg, "--entitlements")) {
+                        entitlements = args_iter.next() orelse {
+                            fatal("expected parameter after {s}", .{arg});
+                        };
                     } else if (mem.eql(u8, arg, "-fcompiler-rt")) {
                         want_compiler_rt = true;
                     } else if (mem.eql(u8, arg, "-fno-compiler-rt")) {
@@ -2742,6 +2747,7 @@ fn buildOutputType(
         .enable_link_snapshots = enable_link_snapshots,
         .native_darwin_sdk = native_darwin_sdk,
         .install_name = install_name,
+        .entitlements = entitlements,
     }) catch |err| switch (err) {
         error.LibCUnavailable => {
             const target = target_info.target;

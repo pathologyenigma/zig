@@ -58,11 +58,6 @@ d_sym: ?DebugSymbols = null,
 /// For x86_64 that's 4KB, whereas for aarch64, that's 16KB.
 page_size: u16,
 
-/// TODO Should we figure out embedding code signatures for other Apple platforms as part of the linker?
-/// Or should this be a separate tool?
-/// https://github.com/ziglang/zig/issues/9567
-requires_adhoc_codesig: bool,
-
 /// If true, the linker will preallocate several sections and segments before starting the linking
 /// process. This is for example true for stage2 debug builds, however, this is false for stage1
 /// and potentially stage2 release builds in the future.
@@ -75,6 +70,9 @@ header_pad: u16 = 0x1000,
 
 /// The absolute address of the entry point.
 entry_addr: ?u64 = null,
+
+/// Code signature (if any)
+code_signature: ?CodeSignature = null,
 
 objects: std.ArrayListUnmanaged(Object) = .{},
 archives: std.ArrayListUnmanaged(Archive) = .{},
@@ -402,7 +400,7 @@ pub fn createEmpty(gpa: Allocator, options: link.Options) !*MachO {
             .file = null,
         },
         .page_size = page_size,
-        .requires_adhoc_codesig = requires_adhoc_codesig,
+        .code_signature = if (requires_adhoc_codesig) .{} else null,
         .needs_prealloc = needs_prealloc,
     };
 
@@ -534,6 +532,7 @@ pub fn flushModule(self: *MachO, comp: *Compilation) !void {
         }
         link.hashAddSystemLibs(&man.hash, self.base.options.system_libs);
         man.hash.addOptionalBytes(self.base.options.sysroot);
+        man.hash.addOptionalBytes(self.base.options.entitlements);
 
         // We don't actually care whether it's a cache hit or miss; we just need the digest and the lock.
         _ = try man.hit();
@@ -859,6 +858,17 @@ pub fn flushModule(self: *MachO, comp: *Compilation) !void {
                 self.load_commands_dirty = true;
             }
 
+            // code signature and entitlements
+            if (self.base.options.entitlements) |path| {
+                if (self.code_signature) |*csig| {
+                    try csig.addEntitlements(self.base.allocator, path);
+                } else {
+                    var csig: CodeSignature = .{};
+                    try csig.addEntitlements(self.base.allocator, path);
+                    self.code_signature = csig;
+                }
+            }
+
             if (self.base.options.verbose_link) {
                 var argv = std.ArrayList([]const u8).init(arena);
 
@@ -1033,7 +1043,7 @@ pub fn flushModule(self: *MachO, comp: *Compilation) !void {
             try d_sym.flushModule(self.base.allocator, self.base.options);
         }
 
-        if (self.requires_adhoc_codesig) {
+        if (self.code_signature) |_| {
             // Preallocate space for the code signature.
             // We need to do this at this stage so that we have the load commands with proper values
             // written out to the file.
@@ -1055,8 +1065,8 @@ pub fn flushModule(self: *MachO, comp: *Compilation) !void {
 
         assert(!self.load_commands_dirty);
 
-        if (self.requires_adhoc_codesig) {
-            try self.writeCodeSignature(); // code signing always comes last
+        if (self.code_signature) |*csig| {
+            try self.writeCodeSignature(csig); // code signing always comes last
         }
 
         if (build_options.enable_link_snapshots) {
@@ -3339,7 +3349,7 @@ fn addLoadDylibLC(self: *MachO, id: u16) !void {
 }
 
 fn addCodeSignatureLC(self: *MachO) !void {
-    if (self.code_signature_cmd_index != null or !self.requires_adhoc_codesig) return;
+    if (self.code_signature_cmd_index != null or self.code_signature == null) return;
     self.code_signature_cmd_index = @intCast(u16, self.load_commands.items.len);
     try self.load_commands.append(self.base.allocator, .{
         .linkedit_data = .{
@@ -3453,6 +3463,10 @@ pub fn deinit(self: *MachO) void {
     }
 
     self.atom_by_index_table.deinit(self.base.allocator);
+
+    if (self.code_signature) |*csig| {
+        csig.deinit(self.base.allocator);
+    }
 }
 
 pub fn closeFiles(self: MachO) void {
@@ -6192,15 +6206,12 @@ fn writeCodeSignaturePadding(self: *MachO) !void {
     self.load_commands_dirty = true;
 }
 
-fn writeCodeSignature(self: *MachO) !void {
+fn writeCodeSignature(self: *MachO, code_sig: *CodeSignature) !void {
     const tracy = trace(@src());
     defer tracy.end();
 
     const text_segment = self.load_commands.items[self.text_segment_cmd_index.?].segment;
     const code_sig_cmd = self.load_commands.items[self.code_signature_cmd_index.?].linkedit_data;
-
-    var code_sig: CodeSignature = .{};
-    defer code_sig.deinit(self.base.allocator);
 
     try code_sig.calcAdhocSignature(
         self.base.allocator,
