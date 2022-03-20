@@ -57,10 +57,64 @@ const Blob = union(enum) {
 
 const CodeDirectory = struct {
     inner: macho.CodeDirectory,
-    data: std.ArrayListUnmanaged(u8) = .{},
+    ident: std.ArrayListUnmanaged(u8) = .{},
+    special_slots: [n_special_slots][hash_size]u8,
+    code_slots: std.ArrayListUnmanaged([hash_size]u8) = .{},
+
+    const n_special_slots: usize = 7;
+
+    fn init(page_size: u16) CodeDirectory {
+        var cdir: CodeDirectory = .{
+            .inner = .{
+                .magic = macho.CSMAGIC_CODEDIRECTORY,
+                .length = @sizeOf(macho.CodeDirectory),
+                .version = macho.CS_SUPPORTSEXECSEG,
+                .flags = macho.CS_ADHOC,
+                .hashOffset = 0,
+                .identOffset = @sizeOf(macho.CodeDirectory),
+                .nSpecialSlots = n_special_slots,
+                .nCodeSlots = 0,
+                .codeLimit = 0,
+                .hashSize = hash_size,
+                .hashType = macho.CS_HASHTYPE_SHA256,
+                .platform = 0,
+                .pageSize = @truncate(u8, std.math.log2(page_size)),
+                .spare2 = 0,
+                .scatterOffset = 0,
+                .teamOffset = 0,
+                .spare3 = 0,
+                .codeLimit64 = 0,
+                .execSegBase = 0,
+                .execSegLimit = 0,
+                .execSegFlags = 0,
+            },
+            .special_slots = undefined,
+        };
+        comptime var i = 0;
+        inline while (i < n_special_slots) : (i += 1) {
+            cdir.special_slots[i] = [_]u8{0} ** hash_size;
+            cdir.inner.length += hash_size;
+        }
+        return cdir;
+    }
 
     fn deinit(self: *CodeDirectory, allocator: Allocator) void {
-        self.data.deinit(allocator);
+        self.ident.deinit(allocator);
+        self.code_slots.deinit(allocator);
+    }
+
+    fn addIdentity(self: *CodeDirectory, allocator: Allocator, ident: []const u8) !void {
+        try self.ident.ensureTotalCapacityPrecise(allocator, ident.len + 1);
+        self.ident.appendSliceAssumeCapacity(ident);
+        self.ident.appendAssumeCapacity(0);
+        self.inner.length += @intCast(u32, self.ident.items.len);
+        self.inner.hashOffset = self.inner.length;
+    }
+
+    fn addSpecialHash(self: *CodeDirectory, index: u32, hash: [hash_size]u8) void {
+        assert(index > 0);
+        // self.inner.nSpecialSlots = std.math.max(self.inner.nSpecialSlots, index);
+        mem.copy(u8, &self.special_slots[index - 1], &hash);
     }
 
     fn slotType(self: CodeDirectory) u32 {
@@ -94,7 +148,17 @@ const CodeDirectory = struct {
         try writer.writeIntBig(u64, self.inner.execSegBase);
         try writer.writeIntBig(u64, self.inner.execSegLimit);
         try writer.writeIntBig(u64, self.inner.execSegFlags);
-        try writer.writeAll(self.data.items);
+
+        try writer.writeAll(self.ident.items);
+
+        var i: isize = n_special_slots;
+        while (i > 0) : (i -= 1) {
+            try writer.writeAll(&self.special_slots[@intCast(usize, i - 1)]);
+        }
+
+        for (self.code_slots.items) |slot| {
+            try writer.writeAll(&slot);
+        }
     }
 };
 
@@ -183,11 +247,9 @@ inner: macho.SuperBlob = .{
 blobs: std.ArrayListUnmanaged(Blob) = .{},
 
 pub fn addEntitlements(self: *CodeSignature, allocator: Allocator, path: []const u8) !void {
-    std.log.warn("adding entitlements from file at {s}", .{path});
     const file = try fs.cwd().openFile(path, .{});
     defer file.close();
     const inner = try file.readToEndAlloc(allocator, std.math.maxInt(u32));
-    std.log.warn("  (contents={s})", .{inner});
     self.entitlements = .{ .inner = inner };
 }
 
@@ -201,92 +263,27 @@ pub fn calcAdhocSignature(
     output_mode: std.builtin.OutputMode,
     page_size: u16,
 ) !void {
-    const execSegBase: u64 = text_segment.fileoff;
-    const execSegLimit: u64 = text_segment.filesize;
-    const execSegFlags: u64 = if (output_mode == .Exe) macho.CS_EXECSEG_MAIN_BINARY else 0;
+    var cdir = CodeDirectory.init(page_size);
+    cdir.inner.execSegBase = text_segment.fileoff;
+    cdir.inner.execSegLimit = text_segment.filesize;
+    cdir.inner.execSegFlags = if (output_mode == .Exe) macho.CS_EXECSEG_MAIN_BINARY else 0;
     const file_size = code_sig_cmd.dataoff;
-    var cdir = CodeDirectory{
-        .inner = .{
-            .magic = macho.CSMAGIC_CODEDIRECTORY,
-            .length = @sizeOf(macho.CodeDirectory),
-            .version = macho.CS_SUPPORTSEXECSEG,
-            .flags = macho.CS_ADHOC,
-            .hashOffset = 0,
-            .identOffset = 0,
-            .nSpecialSlots = 0,
-            .nCodeSlots = 0,
-            .codeLimit = file_size,
-            .hashSize = hash_size,
-            .hashType = macho.CS_HASHTYPE_SHA256,
-            .platform = 0,
-            .pageSize = @truncate(u8, std.math.log2(page_size)),
-            .spare2 = 0,
-            .scatterOffset = 0,
-            .teamOffset = 0,
-            .spare3 = 0,
-            .codeLimit64 = 0,
-            .execSegBase = execSegBase,
-            .execSegLimit = execSegLimit,
-            .execSegFlags = execSegFlags,
-        },
-    };
+    cdir.inner.codeLimit = file_size;
 
     // 1. Save the identifier and update offsets
-    cdir.inner.identOffset = cdir.inner.length;
-    try cdir.data.appendSlice(allocator, id);
-    try cdir.data.append(allocator, 0);
-
-    var hash: [hash_size]u8 = undefined;
-
-    // 2. Create Requirements blob
-    var req: Requirements = .{};
-    cdir.inner.nSpecialSlots = 7;
-    {
-        try cdir.data.appendNTimes(allocator, 0, hash_size);
-    }
-    {
-        try cdir.data.appendNTimes(allocator, 0, hash_size);
-    }
-
-    // 3. Create Entitlements blob
-    if (self.entitlements) |ents| {
-        var buf = std.ArrayList(u8).init(allocator);
-        defer buf.deinit();
-        try ents.write(buf.writer());
-        Sha256.hash(buf.items, &hash, .{});
-        try cdir.data.appendSlice(allocator, &hash);
-    } else {
-        try cdir.data.appendNTimes(allocator, 0, hash_size);
-    }
-    {
-        try cdir.data.appendNTimes(allocator, 0, hash_size);
-    }
-    {
-        try cdir.data.appendNTimes(allocator, 0, hash_size);
-    }
-
-    {
-        var buf = std.ArrayList(u8).init(allocator);
-        defer buf.deinit();
-        try req.write(buf.writer());
-        Sha256.hash(buf.items, &hash, .{});
-        try cdir.data.appendSlice(allocator, &hash);
-    }
-    {
-        try cdir.data.appendNTimes(allocator, 0, hash_size);
-    }
+    try cdir.addIdentity(allocator, id);
 
     const total_pages = mem.alignForward(file_size, page_size) / page_size;
 
     var buffer = try allocator.alloc(u8, page_size);
     defer allocator.free(buffer);
 
-    try cdir.data.ensureUnusedCapacity(allocator, total_pages * hash_size);
+    try cdir.code_slots.ensureTotalCapacityPrecise(allocator, total_pages);
 
     // 2. Calculate hash for each page (in file) and write it to the buffer
     // TODO figure out how we can cache several hashes since we won't update
     // every page during incremental linking
-    cdir.inner.hashOffset = cdir.inner.identOffset + @intCast(u32, cdir.data.items.len);
+    var hash: [hash_size]u8 = undefined;
     var i: usize = 0;
     while (i < total_pages) : (i += 1) {
         const fstart = i * page_size;
@@ -296,28 +293,44 @@ pub fn calcAdhocSignature(
 
         Sha256.hash(buffer[0..fsize], &hash, .{});
 
-        cdir.data.appendSliceAssumeCapacity(&hash);
+        cdir.code_slots.appendAssumeCapacity(hash);
         cdir.inner.nCodeSlots += 1;
+        cdir.inner.length += hash_size;
     }
 
-    // 3. Update CodeDirectory length
-    cdir.inner.length += @intCast(u32, cdir.data.items.len);
-
+    const cdir_ptr = try self.blobs.addOne(allocator);
+    cdir_ptr.* = .{ .code_directory = cdir };
+    // try self.blobs.append(allocator, .{ .code_directory = cdir });
     self.inner.length += @sizeOf(macho.BlobIndex) + cdir.inner.length;
-
-    try self.blobs.append(allocator, .{ .code_directory = cdir });
     self.inner.count += 1;
 
+    // 2. Create Requirements blob
+    var req: Requirements = .{};
+    {
+        var buf = std.ArrayList(u8).init(allocator);
+        defer buf.deinit();
+        try req.write(buf.writer());
+        Sha256.hash(buf.items, &hash, .{});
+        cdir_ptr.code_directory.addSpecialHash(req.slotType(), hash);
+    }
     try self.blobs.append(allocator, .{ .requirements = req });
     self.inner.count += 1;
     self.inner.length += @sizeOf(macho.BlobIndex) + req.size();
 
+    // 3. Create Entitlements blob
     if (self.entitlements) |ents| {
+        var buf = std.ArrayList(u8).init(allocator);
+        defer buf.deinit();
+        try ents.write(buf.writer());
+        Sha256.hash(buf.items, &hash, .{});
+        cdir_ptr.code_directory.addSpecialHash(ents.slotType(), hash);
+
         try self.blobs.append(allocator, .{ .entitlements = try ents.clone(allocator) });
         self.inner.count += 1;
         self.inner.length += @sizeOf(macho.BlobIndex) + ents.size();
     }
 
+    // 4. Create empty Signature blob
     var sig: Signature = .{};
     try self.blobs.append(allocator, .{ .signature = sig });
     self.inner.count += 1;
