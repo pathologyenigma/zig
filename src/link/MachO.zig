@@ -400,7 +400,7 @@ pub fn createEmpty(gpa: Allocator, options: link.Options) !*MachO {
             .file = null,
         },
         .page_size = page_size,
-        .code_signature = if (requires_adhoc_codesig) .{} else null,
+        .code_signature = if (requires_adhoc_codesig) CodeSignature.init(page_size) else null,
         .needs_prealloc = needs_prealloc,
     };
 
@@ -862,9 +862,11 @@ pub fn flushModule(self: *MachO, comp: *Compilation) !void {
             if (self.base.options.entitlements) |path| {
                 if (self.code_signature) |*csig| {
                     try csig.addEntitlements(self.base.allocator, path);
+                    csig.code_directory.ident = self.base.options.emit.?.sub_path;
                 } else {
-                    var csig: CodeSignature = .{};
+                    var csig = CodeSignature.init(self.page_size);
                     try csig.addEntitlements(self.base.allocator, path);
+                    csig.code_directory.ident = self.base.options.emit.?.sub_path;
                     self.code_signature = csig;
                 }
             }
@@ -1044,13 +1046,14 @@ pub fn flushModule(self: *MachO, comp: *Compilation) !void {
         }
 
         if (self.code_signature) |*csig| {
-            csig.reset(self.base.allocator);
+            csig.clear(self.base.allocator);
+            csig.code_directory.ident = self.base.options.emit.?.sub_path;
             // Preallocate space for the code signature.
             // We need to do this at this stage so that we have the load commands with proper values
             // written out to the file.
             // The most important here is to have the correct vm and filesize of the __LINKEDIT segment
             // where the code signature goes into.
-            try self.writeCodeSignaturePadding();
+            try self.writeCodeSignaturePadding(csig);
         }
 
         try self.writeLoadCommands();
@@ -6177,7 +6180,7 @@ fn writeLinkeditSegment(self: *MachO) !void {
     seg.inner.vmsize = mem.alignForwardGeneric(u64, seg.inner.filesize, self.page_size);
 }
 
-fn writeCodeSignaturePadding(self: *MachO) !void {
+fn writeCodeSignaturePadding(self: *MachO, code_sig: *CodeSignature) !void {
     const tracy = trace(@src());
     defer tracy.end();
 
@@ -6187,11 +6190,7 @@ fn writeCodeSignaturePadding(self: *MachO) !void {
     // https://github.com/opensource-apple/cctools/blob/fdb4825f303fd5c0751be524babd32958181b3ed/libstuff/checkout.c#L271
     const fileoff = mem.alignForwardGeneric(u64, linkedit_segment.inner.fileoff + linkedit_segment.inner.filesize, 16);
     const padding = fileoff - (linkedit_segment.inner.fileoff + linkedit_segment.inner.filesize);
-    const needed_size = CodeSignature.calcCodeSignaturePaddingSize(
-        self.base.options.emit.?.sub_path,
-        fileoff,
-        self.page_size,
-    );
+    const needed_size = code_sig.estimateSize(fileoff);
     code_sig_cmd.dataoff = @intCast(u32, fileoff);
     code_sig_cmd.datasize = needed_size;
 
@@ -6214,24 +6213,22 @@ fn writeCodeSignature(self: *MachO, code_sig: *CodeSignature) !void {
     const text_segment = self.load_commands.items[self.text_segment_cmd_index.?].segment;
     const code_sig_cmd = self.load_commands.items[self.code_signature_cmd_index.?].linkedit_data;
 
-    try code_sig.calcAdhocSignature(
-        self.base.allocator,
-        self.base.file.?,
-        self.base.options.emit.?.sub_path,
-        text_segment.inner,
-        code_sig_cmd,
-        self.base.options.output_mode,
-        self.page_size,
-    );
+    var buffer = std.ArrayList(u8).init(self.base.allocator);
+    defer buffer.deinit();
+    try buffer.ensureTotalCapacityPrecise(code_sig.size());
+    try code_sig.writeAdhocSignature(self.base.allocator, .{
+        .file = self.base.file.?,
+        .text_segment = text_segment.inner,
+        .code_sig_cmd = code_sig_cmd,
+        .output_mode = self.base.options.output_mode,
+    }, buffer.writer());
 
-    var buffer = try self.base.allocator.alloc(u8, code_sig.size());
-    defer self.base.allocator.free(buffer);
-    var stream = std.io.fixedBufferStream(buffer);
-    try code_sig.write(stream.writer());
+    log.debug("writing code signature from 0x{x} to 0x{x}", .{
+        code_sig_cmd.dataoff,
+        code_sig_cmd.dataoff + buffer.items.len,
+    });
 
-    log.debug("writing code signature from 0x{x} to 0x{x}", .{ code_sig_cmd.dataoff, code_sig_cmd.dataoff + buffer.len });
-
-    try self.base.file.?.pwriteAll(buffer, code_sig_cmd.dataoff);
+    try self.base.file.?.pwriteAll(buffer.items, code_sig_cmd.dataoff);
 }
 
 /// Writes all load commands and section headers.
